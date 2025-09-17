@@ -15,7 +15,7 @@
     </tr>
     <!-- Continuous integration
     To change the badge to point to a different pipeline, it is not sufficient to simply change the `?branch=` part.
-    You need to go to the Buildkite website and get the SVG URL for the correct pipeline. -->
+    You need to go to the Buildkite website and get the SVG URL for the correct pipeline.hib -->
     <tr>
         <td>Continuous integration</td>
         <td>
