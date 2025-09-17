@@ -1,4 +1,3 @@
-# .github/workflows/llvm-ir-analysis.yml
 name: 🔧 LLVM IR Analysis & Optimization
 
 on:
