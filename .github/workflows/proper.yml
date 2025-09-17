@@ -1,4 +1,3 @@
-# .github/workflows/comprehensive-testing.yml
 name: Comprehensive Julia Testing
 
 on:
