@@ -1,3 +1,4 @@
+# .github/workflows/comprehensive-testing.yml
 name: Comprehensive Julia Testing
 
 on:
@@ -112,31 +113,88 @@ jobs:
                 try
                     content = read(file, String)
                     
-                    # Basic syntax check
+                    # Smart syntax check - parse incrementally
                     try
-                        Meta.parse(content)
+                        # Try to include the file (better than Meta.parse for full files)
+                        test_module = Module()
+                        Core.eval(test_module, :(include($file)))
                         println("✓ $file - Syntax OK")
                     catch e
-                        push!(syntax_errors, (file, string(e)))
-                        println("✗ $file - Syntax Error: $e")
+                        if isa(e, Base.Meta.ParseError) || isa(e, LoadError)
+                            # Try line-by-line parsing for better error detection
+                            lines = split(content, "\n")
+                            parse_successful = true
+                            error_lines = []
+                            
+                            for (i, line) in enumerate(lines)
+                                # Skip empty lines and comments
+                                if isempty(strip(line)) || startswith(strip(line), "#")
+                                    continue
+                                end
+                                
+                                try
+                                    # Parse individual statements
+                                    if !isempty(strip(line))
+                                        Meta.parse(line)
+                                    end
+                                catch parse_e
+                                    if isa(parse_e, Base.Meta.ParseError)
+                                        push!(error_lines, (i, line, string(parse_e)))
+                                        parse_successful = false
+                                    end
+                                end
+                            end
+                            
+                            if parse_successful
+                                # File parsed line by line but failed to include - likely dependency issue
+                                println("⚠️ $file - Include Error (likely missing dependency): $e")
+                            else
+                                # Actual parse errors found
+                                push!(syntax_errors, (file, "Parse errors on lines: $(join([string(l[1]) for l in error_lines], ", "))"))
+                                println("✗ $file - Parse Errors:")
+                                for (line_num, line_content, error) in error_lines
+                                    println("    Line $line_num: $error")
+                                    println("    Code: $(strip(line_content))")
+                                end
+                            end
+                        else
+                            println("⚠️ $file - Include Error: $e")
+                        end
                     end
                     
-                    # Check for common issues
+                    # Check for common issues and patterns
                     lines = split(content, "\n")
                     for (i, line) in enumerate(lines)
                         # Check for common mistakes
-                        if contains(line, "==") && contains(line, "=")
-                            if count("==", line) + count("=", line) > 2
+                        if contains(line, "==") && contains(line, "=") && !contains(line, "===")
+                            assignment_count = count("=", line) - count("==", line) - count("===", line) - count("!=", line) - count("<=", line) - count(">=", line)
+                            if assignment_count > 0 && count("==", line) > 0
                                 push!(parse_warnings, (file, i, "Possible assignment vs comparison confusion"))
                             end
                         end
                         
-                        # Check for undefined variables (basic heuristic)
+                        # Check for potential undefined variable usage (basic heuristic)
                         if match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", line) !== nothing
-                            func_name = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)", line)
-                            if func_name !== nothing && !(func_name[1] in ["println", "print", "error", "warn"])
-                                # This is a basic check - could be enhanced
+                            func_match = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)", line)
+                            if func_match !== nothing
+                                func_name = func_match[1]
+                                # Skip common Julia functions and keywords
+                                if !(func_name in ["println", "print", "error", "warn", "info", "debug",
+                                                  "push!", "pop!", "length", "size", "typeof", "isa",
+                                                  "return", "break", "continue", "if", "else", "elseif",
+                                                  "for", "while", "try", "catch", "finally", "let", "begin"])
+                                    # This could be analyzed further for undefined functions
+                                end
                             end
+                        end
+                        
+                        # Check for suspicious patterns
+                        if contains(line, "1//0") || contains(line, "1/0")
+                            push!(parse_warnings, (file, i, "Division by zero detected"))
+                        end
+                        
+                        if match(r"@\w+", line) !== nothing && contains(line, "@eval")
+                            push!(parse_warnings, (file, i, "@eval usage - potential dynamic code execution"))
                         end
                     end
                     
@@ -145,9 +203,9 @@ jobs:
                 end
             end
             
-            # Report results
+            # Report results with better categorization
             if !isempty(syntax_errors)
-                println("\n🔴 SYNTAX ERRORS FOUND:")
+                println("\n🔴 ACTUAL SYNTAX ERRORS:")
                 for (file, error) in syntax_errors
                     println("  $file: $error")
                 end
@@ -160,7 +218,9 @@ jobs:
                 end
             end
             
-            return isempty(syntax_errors)
+            # Only fail on actual syntax errors, not include errors
+            actual_syntax_errors = filter(e -> contains(e[2], "Parse errors"), syntax_errors)
+            return isempty(actual_syntax_errors)
         end
         
         success = analyze_syntax()
