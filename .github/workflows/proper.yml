@@ -1,766 +1,326 @@
-# .github/workflows/comprehensive-testing.yml
-name: Comprehensive Julia Testing
+# .github/workflows/julia-testing.yml
+name: Julia Testing
 
 on:
   push:
-    branches: [ master, main, develop ]
+    branches: [main, master, develop]
   pull_request:
-    branches: [ master, main, develop ]
-  schedule:
-    - cron: '0 2 * * *'  # Daily at 2 AM
+    branches: [main, master, develop]
   workflow_dispatch:
     inputs:
-      test_intensity:
-        description: 'Test intensity level'
-        required: false
-        default: 'normal'
-        type: choice
-        options:
-        - light
-        - normal
-        - intensive
-        - extreme
+      coverage:
+        description: 'Run code coverage'
+        type: boolean
+        default: true
 
 env:
   JULIA_NUM_THREADS: auto
-  JULIA_PKG_PRECOMPILE_AUTO: 0
 
 jobs:
-  detect-structure:
-    runs-on: ubuntu-latest
-    outputs:
-      has_src: ${{ steps.structure.outputs.has_src }}
-      has_test: ${{ steps.structure.outputs.has_test }}
-      has_docs: ${{ steps.structure.outputs.has_docs }}
-      has_examples: ${{ steps.structure.outputs.has_examples }}
-      julia_files: ${{ steps.structure.outputs.julia_files }}
-      test_files: ${{ steps.structure.outputs.test_files }}
-      packages: ${{ steps.structure.outputs.packages }}
-    steps:
-    - uses: actions/checkout@v4
-    - name: Analyze Repository Structure
-      id: structure
-      run: |
-        echo "Analyzing repository structure..."
-        
-        # Check for standard Julia directories
-        echo "has_src=$([ -d 'src' ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-        echo "has_test=$([ -d 'test' ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-        echo "has_docs=$([ -d 'docs' ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-        echo "has_examples=$([ -d 'examples' ] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-        
-        # Find all Julia files
-        julia_files=$(find . -name "*.jl" -not -path "./.git/*" | wc -l)
-        echo "julia_files=$julia_files" >> $GITHUB_OUTPUT
-        
-        # Find test files specifically
-        test_files=$(find . -name "*test*.jl" -o -name "test*.jl" -o -path "*/test/*" -name "*.jl" | wc -l)
-        echo "test_files=$test_files" >> $GITHUB_OUTPUT
-        
-        # Detect packages from Project.toml or Manifest.toml
-        packages=""
-        if [ -f "Project.toml" ]; then
-          packages=$(grep -E "^\[deps\]" -A 100 Project.toml | grep -E "^[a-zA-Z]" | cut -d' ' -f1 | tr '\n' ',' || echo "")
-        fi
-        echo "packages=$packages" >> $GITHUB_OUTPUT
-        
-        # Create file inventory
-        echo "=== REPOSITORY STRUCTURE ===" > structure_report.txt
-        echo "Julia files: $julia_files" >> structure_report.txt
-        echo "Test files: $test_files" >> structure_report.txt
-        echo "Directories:" >> structure_report.txt
-        find . -type d -not -path "./.git/*" | head -20 >> structure_report.txt
-        echo "Julia files list:" >> structure_report.txt
-        find . -name "*.jl" -not -path "./.git/*" | head -50 >> structure_report.txt
-        
-    - name: Upload Structure Report
-      uses: actions/upload-artifact@v4
-      with:
-        name: repository-structure
-        path: structure_report.txt
-
-  syntax-analysis:
-    needs: detect-structure
-    runs-on: ubuntu-latest
-    if: needs.detect-structure.outputs.julia_files > 0
-    steps:
-    - uses: actions/checkout@v4
-    - uses: julia-actions/setup-julia@v1
-      with:
-        version: '1.10'
-    - name: Deep Syntax Analysis
-      run: |
-        julia --project -e '
-        using Pkg
-        Pkg.add(["JuliaFormatter", "StaticLint"])
-        
-        function analyze_syntax()
-            julia_files = []
-            for (root, dirs, files) in walkdir(".")
-                for file in files
-                    if endswith(file, ".jl") && !contains(root, ".git")
-                        push!(julia_files, joinpath(root, file))
-                    end
-                end
-            end
-            
-            println("Found $(length(julia_files)) Julia files")
-            
-            syntax_errors = []
-            parse_warnings = []
-            
-            for file in julia_files
-                try
-                    content = read(file, String)
-                    
-                    # Smart syntax check - parse incrementally
-                    try
-                        # Try to include the file (better than Meta.parse for full files)
-                        test_module = Module()
-                        Core.eval(test_module, :(include($file)))
-                        println("✓ $file - Syntax OK")
-                    catch e
-                        if isa(e, Base.Meta.ParseError) || isa(e, LoadError)
-                            # Try line-by-line parsing for better error detection
-                            lines = split(content, "\n")
-                            parse_successful = true
-                            error_lines = []
-                            
-                            for (i, line) in enumerate(lines)
-                                # Skip empty lines and comments
-                                if isempty(strip(line)) || startswith(strip(line), "#")
-                                    continue
-                                end
-                                
-                                try
-                                    # Parse individual statements
-                                    if !isempty(strip(line))
-                                        Meta.parse(line)
-                                    end
-                                catch parse_e
-                                    if isa(parse_e, Base.Meta.ParseError)
-                                        push!(error_lines, (i, line, string(parse_e)))
-                                        parse_successful = false
-                                    end
-                                end
-                            end
-                            
-                            if parse_successful
-                                # File parsed line by line but failed to include - likely dependency issue
-                                println("⚠️ $file - Include Error (likely missing dependency): $e")
-                            else
-                                # Actual parse errors found
-                                push!(syntax_errors, (file, "Parse errors on lines: $(join([string(l[1]) for l in error_lines], ", "))"))
-                                println("✗ $file - Parse Errors:")
-                                for (line_num, line_content, error) in error_lines
-                                    println("    Line $line_num: $error")
-                                    println("    Code: $(strip(line_content))")
-                                end
-                            end
-                        else
-                            println("⚠️ $file - Include Error: $e")
-                        end
-                    end
-                    
-                    # Check for common issues and patterns
-                    lines = split(content, "\n")
-                    for (i, line) in enumerate(lines)
-                        # Check for common mistakes
-                        if contains(line, "==") && contains(line, "=") && !contains(line, "===")
-                            assignment_count = count("=", line) - count("==", line) - count("===", line) - count("!=", line) - count("<=", line) - count(">=", line)
-                            if assignment_count > 0 && count("==", line) > 0
-                                push!(parse_warnings, (file, i, "Possible assignment vs comparison confusion"))
-                            end
-                        end
-                        
-                        # Check for potential undefined variable usage (basic heuristic)
-                        if match(r"^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(", line) !== nothing
-                            func_match = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)", line)
-                            if func_match !== nothing
-                                func_name = func_match[1]
-                                # Skip common Julia functions and keywords
-                                if !(func_name in ["println", "print", "error", "warn", "info", "debug",
-                                                  "push!", "pop!", "length", "size", "typeof", "isa",
-                                                  "return", "break", "continue", "if", "else", "elseif",
-                                                  "for", "while", "try", "catch", "finally", "let", "begin"])
-                                    # This could be analyzed further for undefined functions
-                                end
-                            end
-                        end
-                        
-                        # Check for suspicious patterns
-                        if contains(line, "1//0") || contains(line, "1/0")
-                            push!(parse_warnings, (file, i, "Division by zero detected"))
-                        end
-                        
-                        if match(r"@\w+", line) !== nothing && contains(line, "@eval")
-                            push!(parse_warnings, (file, i, "@eval usage - potential dynamic code execution"))
-                        end
-                    end
-                    
-                catch e
-                    push!(syntax_errors, (file, "Cannot read file: $e"))
-                end
-            end
-            
-            # Report results with better categorization
-            if !isempty(syntax_errors)
-                println("\n🔴 ACTUAL SYNTAX ERRORS:")
-                for (file, error) in syntax_errors
-                    println("  $file: $error")
-                end
-            end
-            
-            if !isempty(parse_warnings)
-                println("\n⚠️  POTENTIAL ISSUES:")
-                for (file, line, warning) in parse_warnings
-                    println("  $file:$line - $warning")
-                end
-            end
-            
-            # Only fail on actual syntax errors, not include errors
-            actual_syntax_errors = filter(e -> contains(e[2], "Parse errors"), syntax_errors)
-            return isempty(actual_syntax_errors)
-        end
-        
-        success = analyze_syntax()
-        exit(success ? 0 : 1)
-        '
-
-  comprehensive-property-testing:
-    needs: [detect-structure, syntax-analysis]
-    runs-on: ubuntu-latest
+  test:
+    name: Test Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
-        test-category: ['mathematical', 'edge-cases', 'performance', 'memory']
+        version: ['1.6', '1.10', 'nightly']
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        exclude:
+          - version: nightly
+            os: windows-latest
+          - version: nightly  
+            os: macos-latest
+    
     steps:
     - uses: actions/checkout@v4
-    - uses: julia-actions/setup-julia@v1
+    
+    - uses: julia-actions/setup-julia@v2
       with:
-        version: '1.10'
-    - name: Install Testing Dependencies
-      run: |
-        julia --project -e '
-        using Pkg
-        Pkg.add(["Test", "Random", "BenchmarkTools", "Profile", "StaticArrays"])
-        '
-    - name: ${{ matrix.test-category }} Property Testing
-      run: |
-        julia --project -e '
-        using Test, Random, BenchmarkTools, Profile
-        
-        # Load all Julia files in the repository
-        function load_all_julia_files()
-            loaded_modules = []
-            julia_files = []
-            
-            for (root, dirs, files) in walkdir(".")
-                for file in files
-                    if endswith(file, ".jl") && !contains(root, ".git") && !contains(file, "test")
-                        push!(julia_files, joinpath(root, file))
-                    end
-                end
-            end
-            
-            println("Loading $(length(julia_files)) Julia files...")
-            
-            for file in julia_files
-                try
-                    include(file)
-                    println("✓ Loaded: $file")
-                    push!(loaded_modules, file)
-                catch e
-                    println("⚠️  Could not load $file: $e")
-                end
-            end
-            
-            return loaded_modules
-        end
-        
-        # Mathematical property testing
-        function mathematical_property_tests()
-            test_intensity = get(ENV, "test_intensity", "normal")
-            iterations = test_intensity == "extreme" ? 50000 : 
-                        test_intensity == "intensive" ? 10000 : 5000
-            
-            println("🧮 Running mathematical property tests ($iterations iterations)...")
-            
-            # Test all numeric types
-            numeric_types = [Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, 
-                           Float32, Float64, BigInt, Rational{Int}]
-            
-            failures = 0
-            total_tests = 0
-            
-            for T in numeric_types
-                println("Testing type: $T")
-                
-                for _ in 1:div(iterations, length(numeric_types))
-                    total_tests += 1
-                    
-                    if T <: Integer
-                        # Integer-specific tests
-                        try
-                            if T <: Signed
-                                a = rand(T(-1000):T(1000))
-                                b = rand(T(-1000):T(1000))
-                            else
-                                a = rand(T(1):T(1000))
-                                b = rand(T(1):T(1000))
-                            end
-                            
-                            # Test basic arithmetic properties
-                            if a + b != b + a
-                                println("❌ Commutative property failed for +: $a + $b")
-                                failures += 1
-                            end
-                            
-                            if a * b != b * a
-                                println("❌ Commutative property failed for *: $a * $b")
-                                failures += 1
-                            end
-                            
-                            # Test modular arithmetic if applicable
-                            if b != 0 && hasmethod(mod, (T, T))
-                                result = mod(a, b)
-                                if !(result >= 0 && result < abs(b))
-                                    println("❌ Modular arithmetic property failed: mod($a, $b) = $result")
-                                    failures += 1
-                                end
-                            end
-                            
-                        catch e
-                            # Some overflow expected for small integer types
-                            if !isa(e, OverflowError)
-                                failures += 1
-                            end
-                        end
-                        
-                    elseif T <: AbstractFloat
-                        # Float-specific tests
-                        a = rand(T) * 1000 - 500
-                        b = rand(T) * 1000 - 500
-                        
-                        # Test NaN and Inf handling
-                        if !isnan(a + NaN)
-                            println("❌ NaN propagation failed for type $T")
-                            failures += 1
-                        end
-                        
-                        # Test basic properties (accounting for floating point precision)
-                        if abs((a + b) - (b + a)) > eps(T) * 100
-                            println("❌ Float commutative property failed: $a + $b vs $b + $a")
-                            failures += 1
-                        end
-                    end
-                end
-            end
-            
-            println("Mathematical tests: $failures failures out of $total_tests tests")
-            return failures == 0
-        end
-        
-        # Edge case testing
-        function edge_case_tests()
-            println("🔍 Running edge case tests...")
-            
-            failures = 0
-            
-            # Test boundary values for all integer types
-            integer_types = [Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64]
-            
-            for T in integer_types
-                try
-                    # Test type limits
-                    min_val = typemin(T)
-                    max_val = typemax(T)
-                    
-                    # Test operations at boundaries
-                    if T <: Signed
-                        # Test overflow detection
-                        try
-                            result = checked_add(max_val, T(1))
-                            println("❌ Overflow not detected for $T: $max_val + 1")
-                            failures += 1
-                        catch OverflowError
-                            # Expected
-                        end
-                        
-                        try
-                            result = checked_sub(min_val, T(1))
-                            println("❌ Underflow not detected for $T: $min_val - 1")
-                            failures += 1
-                        catch OverflowError
-                            # Expected
-                        end
-                    end
-                    
-                    # Test zero handling
-                    if T <: Signed && hasmethod(div, (T, T))
-                        try
-                            result = div(T(1), T(0))
-                            println("❌ Division by zero not handled for $T")
-                            failures += 1
-                        catch DivideError
-                            # Expected
-                        end
-                    end
-                    
-                catch e
-                    println("⚠️  Edge case test error for $T: $e")
-                    failures += 1
-                end
-            end
-            
-            println("Edge case tests: $failures failures")
-            return failures == 0
-        end
-        
-        # Performance testing
-        function performance_tests()
-            println("⚡ Running performance tests...")
-            
-            # Test common operations for performance regressions
-            test_data = rand(1000)
-            
-            # Benchmark basic operations
-            sort_time = @elapsed sort(test_data)
-            println("Sort time for 1000 elements: $(sort_time * 1000) ms")
-            
-            # Test memory allocation patterns
-            function memory_test()
-                data = []
-                for i in 1:1000
-                    push!(data, rand())
-                end
-                return data
-            end
-            
-            alloc_result = @timed memory_test()
-            println("Memory allocation test: $(alloc_result.bytes) bytes, $(alloc_result.time * 1000) ms")
-            
-            # Performance should be reasonable (adjust thresholds as needed)
-            performance_ok = sort_time < 1.0 && alloc_result.time < 0.1
-            
-            if !performance_ok
-                println("❌ Performance regression detected")
-            end
-            
-            return performance_ok
-        end
-        
-        # Memory safety testing
-        function memory_tests()
-            println("🧠 Running memory tests...")
-            
-            failures = 0
-            
-            # Test for memory leaks in loops
-            initial_memory = Base.gc_bytes()
-            
-            for _ in 1:10000
-                temp_array = rand(100)
-                sum(temp_array)
-                temp_array = nothing
-            end
-            
-            GC.gc()  # Force garbage collection
-            final_memory = Base.gc_bytes()
-            
-            memory_growth = final_memory - initial_memory
-            println("Memory growth during test: $memory_growth bytes")
-            
-            # Test array bounds checking
-            test_array = [1, 2, 3, 4, 5]
-            try
-                val = test_array[10]  # Should throw BoundsError
-                println("❌ Array bounds check failed")
-                failures += 1
-            catch BoundsError
-                # Expected
-            end
-            
-            return failures == 0
-        end
-        
-        # Load all Julia files first
-        loaded_modules = load_all_julia_files()
-        
-        # Run appropriate test category
-        test_category = "${{ matrix.test-category }}"
-        success = false
-        
-        if test_category == "mathematical"
-            success = mathematical_property_tests()
-        elseif test_category == "edge-cases"
-            success = edge_case_tests()
-        elseif test_category == "performance"
-            success = performance_tests()
-        elseif test_category == "memory"
-            success = memory_tests()
-        end
-        
-        println("✅ Test category $test_category completed: $(success ? "PASSED" : "FAILED")")
-        exit(success ? 0 : 1)
-        '
+        version: ${{ matrix.version }}
+    
+    - uses: julia-actions/cache@v2
+    
+    - name: Install Dependencies
+      uses: julia-actions/julia-buildpkg@v1
+    
+    - name: Run Tests
+      uses: julia-actions/julia-runtest@v1
+      with:
+        annotate: true
+    
+    - name: Process Coverage
+      if: matrix.version == '1.10' && matrix.os == 'ubuntu-latest' && (github.event_name == 'push' || inputs.coverage)
+      uses: julia-actions/julia-processcoverage@v1
+    
+    - name: Upload Coverage
+      if: matrix.version == '1.10' && matrix.os == 'ubuntu-latest' && (github.event_name == 'push' || inputs.coverage)
+      uses: codecov/codecov-action@v4
+      with:
+        files: lcov.info
+        token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: false
 
-  function-discovery-testing:
-    needs: detect-structure
+  format-check:
+    name: Format Check
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: julia-actions/setup-julia@v1
+    
+    - uses: julia-actions/setup-julia@v2
       with:
         version: '1.10'
-    - name: Discover and Test All Functions
+    
+    - name: Check Formatting
       run: |
-        julia --project -e '
-        using InteractiveUtils, Test
+        julia -e '
+        using Pkg
+        Pkg.add("JuliaFormatter")
+        using JuliaFormatter
         
-        # Comprehensive function discovery and testing
-        function discover_and_test_functions()
-            println("🔍 Discovering all functions in repository...")
-            
-            # Load all Julia files and extract function definitions
-            discovered_functions = Set{String}()
-            function_locations = Dict{String, Vector{String}}()
-            
+        formatted = format(".", verbose=true, overwrite=false)
+        if !formatted
+            println("Code formatting issues found. Run JuliaFormatter.jl to fix.")
+            exit(1)
+        else
+            println("Code formatting is correct.")
+        end
+        '
+
+  lint:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - uses: julia-actions/setup-julia@v2
+      with:
+        version: '1.10'
+    
+    - name: Run Linter
+      run: |
+        julia -e '
+        using Pkg
+        Pkg.add(["StaticLint", "LanguageServer"])
+        using StaticLint
+        
+        function lint_files()
+            issues = []
             for (root, dirs, files) in walkdir(".")
+                if occursin(".git", root) || occursin("Manifest.toml", root)
+                    continue
+                end
                 for file in files
-                    if endswith(file, ".jl") && !contains(root, ".git")
+                    if endswith(file, ".jl")
                         filepath = joinpath(root, file)
                         try
                             content = read(filepath, String)
-                            lines = split(content, "\n")
-                            
-                            for (i, line) in enumerate(lines)
-                                # Match function definitions
-                                func_match = match(r"^\s*function\s+([a-zA-Z_][a-zA-Z0-9_!]*)", line)
-                                if func_match !== nothing
-                                    func_name = func_match[1]
-                                    push!(discovered_functions, func_name)
-                                    if !haskey(function_locations, func_name)
-                                        function_locations[func_name] = []
-                                    end
-                                    push!(function_locations[func_name], "$filepath:$i")
-                                end
-                                
-                                # Match short-form function definitions
-                                short_func_match = match(r"^\s*([a-zA-Z_][a-zA-Z0-9_!]*)\s*\([^)]*\)\s*=", line)
-                                if short_func_match !== nothing
-                                    func_name = short_func_match[1]
-                                    push!(discovered_functions, func_name)
-                                    if !haskey(function_locations, func_name)
-                                        function_locations[func_name] = []
-                                    end
-                                    push!(function_locations[func_name], "$filepath:$i")
-                                end
+                            # Basic syntax validation
+                            try
+                                Meta.parse(content)
+                                println("PASS: $filepath")
+                            catch e
+                                println("FAIL: $filepath - $e")
+                                push!(issues, filepath)
                             end
                         catch e
-                            println("⚠️  Could not analyze $filepath: $e")
+                            println("ERROR: Cannot read $filepath - $e")
+                            push!(issues, filepath)
                         end
                     end
                 end
             end
-            
-            println("Found $(length(discovered_functions)) function definitions:")
-            for func in sort(collect(discovered_functions))
-                locations = get(function_locations, func, [])
-                println("  $func ($(length(locations)) definitions)")
-                for loc in locations
-                    println("    📍 $loc")
-                end
-            end
-            
-            return discovered_functions, function_locations
+            return length(issues) == 0
         end
         
-        functions, locations = discover_and_test_functions()
-        
-        # Generate comprehensive test report
-        open("function_discovery_report.txt", "w") do io
-            println(io, "=== FUNCTION DISCOVERY REPORT ===")
-            println(io, "Total functions discovered: $(length(functions))")
-            println(io, "")
-            
-            for func in sort(collect(functions))
-                println(io, "Function: $func")
-                func_locations = get(locations, func, [])
-                for loc in func_locations
-                    println(io, "  Location: $loc")
-                end
-                println(io, "")
-            end
+        if !lint_files()
+            println("Linting issues found.")
+            exit(1)
         end
         '
-    - name: Upload Function Discovery Report
-      uses: actions/upload-artifact@v4
-      with:
-        name: function-discovery-report
-        path: function_discovery_report.txt
 
-  integration-testing:
-    needs: [detect-structure, syntax-analysis, comprehensive-property-testing]
+  docs:
+    name: Documentation
     runs-on: ubuntu-latest
-    if: needs.detect-structure.outputs.has_test == 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
     - uses: actions/checkout@v4
-    - uses: julia-actions/setup-julia@v1
+    
+    - uses: julia-actions/setup-julia@v2
       with:
         version: '1.10'
-    - name: Run Existing Tests with Enhanced Reporting
+    
+    - uses: julia-actions/cache@v2
+    
+    - name: Install Dependencies
+      uses: julia-actions/julia-buildpkg@v1
+    
+    - name: Build Documentation
       run: |
-        julia --project -e '
-        using Pkg, Test
-        
-        # Enhanced test running with detailed reporting
-        function run_enhanced_tests()
-            println("🧪 Running enhanced integration tests...")
-            
-            # Install the package if Project.toml exists
-            if isfile("Project.toml")
-                try
-                    Pkg.activate(".")
-                    Pkg.instantiate()
-                    println("✅ Package environment activated")
-                catch e
-                    println("⚠️  Could not activate package: $e")
-                end
-            end
-            
-            # Find and run all test files
-            test_files = []
-            for (root, dirs, files) in walkdir(".")
-                for file in files
-                    if (contains(file, "test") || contains(root, "test")) && 
-                       endswith(file, ".jl") && !contains(root, ".git")
-                        push!(test_files, joinpath(root, file))
-                    end
-                end
-            end
-            
-            println("Found $(length(test_files)) test files:")
-            for file in test_files
-                println("  📄 $file")
-            end
-            
-            # Run tests with detailed output
-            total_tests = 0
-            total_failures = 0
-            
-            for test_file in test_files
-                println("\n🔍 Running tests from: $test_file")
-                try
-                    # Capture test output
-                    test_results = @testset "Enhanced Test: $test_file" begin
-                        include(test_file)
-                    end
-                    
-                    println("✅ Tests in $test_file completed successfully")
-                    
-                catch e
-                    println("❌ Tests in $test_file failed: $e")
-                    total_failures += 1
-                end
-                total_tests += 1
-            end
-            
-            println("\n=== TEST SUMMARY ===")
-            println("Total test files: $total_tests")
-            println("Failed test files: $total_failures")
-            println("Success rate: $((total_tests - total_failures) / total_tests * 100)%")
-            
-            return total_failures == 0
+        julia --project=docs -e '
+        using Pkg
+        if isfile("docs/Project.toml")
+            Pkg.develop(PackageSpec(path=pwd()))
+            Pkg.instantiate()
+        else
+            println("No docs environment found, skipping documentation build")
+            exit(0)
         end
         
-        success = run_enhanced_tests()
-        exit(success ? 0 : 1)
+        if isfile("docs/make.jl")
+            include("docs/make.jl")
+        else
+            println("No docs/make.jl found, skipping documentation build")
+        end
         '
 
-  generate-report:
-    needs: [detect-structure, syntax-analysis, comprehensive-property-testing, function-discovery-testing, integration-testing]
+  benchmark:
+    name: Benchmarks
     runs-on: ubuntu-latest
-    if: always()
+    if: github.event_name == 'pull_request'
     steps:
     - uses: actions/checkout@v4
-    - name: Download All Artifacts
-      uses: actions/download-artifact@v4
       with:
-        path: artifacts/
-    - name: Generate Comprehensive Report
+        fetch-depth: 0
+    
+    - uses: julia-actions/setup-julia@v2
+      with:
+        version: '1.10'
+    
+    - uses: julia-actions/cache@v2
+    
+    - name: Install Dependencies
+      uses: julia-actions/julia-buildpkg@v1
+    
+    - name: Run Benchmarks
       run: |
-        echo "# 🔬 Comprehensive Julia Testing Report" > TESTING_REPORT.md
-        echo "" >> TESTING_REPORT.md
-        echo "Generated on: $(date)" >> TESTING_REPORT.md
-        echo "Repository: ${{ github.repository }}" >> TESTING_REPORT.md
-        echo "Commit: ${{ github.sha }}" >> TESTING_REPORT.md
-        echo "" >> TESTING_REPORT.md
+        julia -e '
+        using Pkg
         
-        echo "## 📊 Test Results Summary" >> TESTING_REPORT.md
-        echo "" >> TESTING_REPORT.md
-        echo "| Test Category | Status |" >> TESTING_REPORT.md
-        echo "|---------------|--------|" >> TESTING_REPORT.md
-        echo "| Syntax Analysis | ${{ needs.syntax-analysis.result }} |" >> TESTING_REPORT.md
-        echo "| Property Testing | ${{ needs.comprehensive-property-testing.result }} |" >> TESTING_REPORT.md  
-        echo "| Function Discovery | ${{ needs.function-discovery-testing.result }} |" >> TESTING_REPORT.md
-        echo "| Integration Testing | ${{ needs.integration-testing.result }} |" >> TESTING_REPORT.md
-        echo "" >> TESTING_REPORT.md
-        
-        echo "## 🏗️ Repository Structure" >> TESTING_REPORT.md
-        if [ -f "artifacts/repository-structure/structure_report.txt" ]; then
-          echo '```' >> TESTING_REPORT.md
-          cat artifacts/repository-structure/structure_report.txt >> TESTING_REPORT.md
-          echo '```' >> TESTING_REPORT.md
+        # Check if benchmark directory exists
+        if isdir("benchmark")
+            try
+                Pkg.add("BenchmarkTools")
+                println("Running benchmarks...")
+                
+                # Simple benchmark runner
+                benchmark_files = filter(f -> endswith(f, ".jl"), readdir("benchmark", join=true))
+                
+                if isempty(benchmark_files)
+                    println("No benchmark files found in benchmark/ directory")
+                    exit(0)
+                end
+                
+                for bench_file in benchmark_files
+                    println("Running benchmark: $bench_file")
+                    try
+                        include(bench_file)
+                    catch e
+                        println("Benchmark failed: $e")
+                    end
+                end
+                
+            catch e
+                println("Benchmark execution failed: $e")
+                exit(1)
+            end
+        else
+            println("No benchmark directory found, skipping benchmarks")
+        end
+        '
+
+  validate-project:
+    name: Project Validation
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Validate Project Structure
+      run: |
+        # Validate Julia package structure
+        if [[ ! -f "Project.toml" ]]; then
+          echo "ERROR: Project.toml not found"
+          exit 1
         fi
-        echo "" >> TESTING_REPORT.md
         
-        echo "## 🔍 Discovered Functions" >> TESTING_REPORT.md
-        if [ -f "artifacts/function-discovery-report/function_discovery_report.txt" ]; then
-          echo '```' >> TESTING_REPORT.md
-          head -50 artifacts/function-discovery-report/function_discovery_report.txt >> TESTING_REPORT.md
-          echo '```' >> TESTING_REPORT.md
-        fi
-        echo "" >> TESTING_REPORT.md
-        
-        echo "## 🎯 Recommendations" >> TESTING_REPORT.md
-        echo "" >> TESTING_REPORT.md
-        
-        # Generate recommendations based on results
-        if [ "${{ needs.syntax-analysis.result }}" != "success" ]; then
-          echo "- 🔴 **Fix syntax errors** - Critical issues found in code parsing" >> TESTING_REPORT.md
-        fi
-        
-        if [ "${{ needs.comprehensive-property-testing.result }}" != "success" ]; then
-          echo "- 🟡 **Review mathematical properties** - Some property tests failed" >> TESTING_REPORT.md
+        # Check if this is a package (has src/) or script collection
+        if [[ -d "src" ]]; then
+          echo "Detected Julia package structure"
+          
+          # Validate package structure
+          if [[ ! -f "src/$(basename $PWD).jl" ]] && [[ ! -f "src/$(grep -o 'name = ".*"' Project.toml | cut -d'"' -f2).jl" ]]; then
+            echo "WARNING: Main module file not found in src/"
+          fi
+          
+          if [[ -d "test" ]] && [[ ! -f "test/runtests.jl" ]]; then
+            echo "WARNING: test/runtests.jl not found"
+          fi
+        else
+          echo "Detected Julia script collection"
         fi
         
-        if [ "${{ needs.integration-testing.result }}" != "success" ]; then
-          echo "- 🟠 **Improve test coverage** - Integration tests need attention" >> TESTING_REPORT.md
+        # Validate Project.toml syntax
+        julia -e '
+        using Pkg
+        try
+            project = Pkg.TOML.parsefile("Project.toml")
+            println("Project.toml is valid")
+            
+            if haskey(project, "name")
+                println("Package name: $(project["name"])")
+            end
+            
+            if haskey(project, "version")
+                println("Version: $(project["version"])")
+            end
+            
+        catch e
+            println("ERROR: Invalid Project.toml - $e")
+            exit(1)
+        end
+        '
+
+  report:
+    name: Generate Report  
+    if: always()
+    needs: [test, format-check, lint, validate-project]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Generate Test Report
+      run: |
+        cat > test_report.md << 'EOF'
+        # Julia Testing Report
+        
+        ## Test Results
+        - Tests: ${{ needs.test.result }}
+        - Format Check: ${{ needs.format-check.result }}
+        - Static Analysis: ${{ needs.lint.result }}
+        - Project Validation: ${{ needs.validate-project.result }}
+        
+        ## Summary
+        EOF
+        
+        if [[ "${{ needs.test.result }}" == "success" && "${{ needs.format-check.result }}" == "success" && "${{ needs.lint.result }}" == "success" ]]; then
+          echo "All checks passed successfully." >> test_report.md
+        else
+          echo "Some checks failed. Please review the logs above." >> test_report.md
         fi
         
-        echo "- ✅ **Add more property-based tests** for critical functions" >> TESTING_REPORT.md
-        echo "- 📈 **Consider performance profiling** for optimization opportunities" >> TESTING_REPORT.md
-        echo "- 🛡️ **Implement fuzzing tests** for edge case discovery" >> TESTING_REPORT.md
-        
-        echo "" >> TESTING_REPORT.md
-        echo "---" >> TESTING_REPORT.md
-        echo "*Report generated by Comprehensive Julia Testing Pipeline*" >> TESTING_REPORT.md
-        
-    - name: Upload Comprehensive Report
+    - name: Upload Report
       uses: actions/upload-artifact@v4
       with:
-        name: comprehensive-testing-report
-        path: TESTING_REPORT.md
+        name: test-report
+        path: test_report.md
     
-    - name: Comment PR with Results
-      if: github.event_name == 'pull_request'
+    - name: Comment PR
+      if: github.event_name == 'pull_request' && (needs.test.result != 'success' || needs.format-check.result != 'success' || needs.lint.result != 'success')
       uses: actions/github-script@v7
       with:
         script: |
           const fs = require('fs');
-          const report = fs.readFileSync('TESTING_REPORT.md', 'utf8');
+          const report = fs.readFileSync('test_report.md', 'utf8');
           
-          github.rest.issues.createComment({
+          await github.rest.issues.createComment({
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
