@@ -248,7 +248,11 @@ jobs:
 
     - name: Run Core Tests
       run: |
-        JULIA_CMD=$([[ -f "./julia" ]] && echo "./julia" || echo "julia")
+        if [[ -f "./julia" ]]; then
+          JULIA_CMD="./julia"
+        else
+          JULIA_CMD="julia"
+        fi
         
         echo "Running core functionality tests with $JULIA_CMD"
         
@@ -328,7 +332,11 @@ jobs:
 
     - name: Test Package Loading
       run: |
-        JULIA_CMD=$([[ -f "./julia" ]] && echo "./julia" || echo "julia")
+        if [[ -f "./julia" ]]; then
+          JULIA_CMD="./julia"
+        else
+          JULIA_CMD="julia"
+        fi
         
         echo "Testing ${{ matrix.package }} with $JULIA_CMD"
         
@@ -505,10 +513,10 @@ jobs:
         total_errors=0
         
         # Validate key directories with reasonable limits
-        validate_directory "base" 30
+        validate_directory "base" 900
         total_errors=$((total_errors + $?))
         
-        validate_directory "stdlib" 20
+        validate_directory "stdlib" 900
         total_errors=$((total_errors + $?))
         
         if [[ $total_errors -gt 5 ]]; then
